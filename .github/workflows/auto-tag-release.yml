@@ -1,0 +1,91 @@
+name: Auto tag and release - Production and Pre-release
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches:
+      - main
+      - uat
+      - develop
+
+jobs:
+  tag-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate new tag
+        id: tag_version
+        uses: mathieudutour/github-tag-action@v6.1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Define which branches should create pre-releases
+          pre_release_branches: uat
+          # Optional: Customize the pre-release suffix
+          append_to_pre_release_tag: rc
+          # Main branch creates stable releases
+          release_branches: main
+
+      - name: Display new tag
+        run: echo "New tag is ${{ steps.tag_version.outputs.new_tag }}"
+
+      # - name: Read version
+      #   id: version
+      #   run: |
+      #     VER=$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' VERSION || echo "")
+      #     BRANCH=$(echo "${GITHUB_REF##*/}")
+      #     echo "tag=${BRANCH}-${VER}" >> $GITHUB_OUTPUT
+      #     echo "version=${VER}" >> $GITHUB_OUTPUT
+      #     echo "branch=${BRANCH}" >> $GITHUB_OUTPUT
+
+      #     # Determine release type based on branch
+      #     if [ "${BRANCH}" = "main" ]; then
+      #       echo "release_type=production" >> $GITHUB_OUTPUT
+      #       echo "prerelease=false" >> $GITHUB_OUTPUT
+      #     else
+      #       echo "release_type=pre-release" >> $GITHUB_OUTPUT
+      #       echo "prerelease=true" >> $GITHUB_OUTPUT
+      #     fi
+
+      # - name: Check if tag exists
+      #   id: check_tag
+      #   run: |
+      #     if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+      #       echo "tag_exists=true" >> $GITHUB_OUTPUT
+      #       echo "⚠️ Tag already exists, Skipping release"
+      #     else
+      #       echo "tag_exists=false" >> $GITHUB_OUTPUT
+      #     fi
+
+      # - name: Create tag
+      #   if: ${{ steps.check_tag.outputs.tag_exists == 'false' }}
+      #   run: |
+      #     git config user.name github-actions
+      #     git config user.email github-actions@github.com
+      #     git tag ${{ steps.version.outputs.tag }}
+      #     git push origin ${{ steps.version.outputs.tag }}
+
+      # - name: Create release
+      #   if: steps.version.outputs.branch != 'develop'
+      #   uses: ncipollo/release-action@v1
+      #   with:
+      #     tag: ${{ steps.version.outputs.tag }}
+      #     name: Release ${{ steps.version.outputs.version }} (${{ steps.version.outputs.branch }})
+      #     draft: false
+      #     prerelease: ${{ steps.version.outputs.prerelease }}
+      #     generateReleaseNotes: true
+
+      - name: Create github release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.tag_version.outputs.new_tag }}
+          release_name: Release ${{ steps.tag_version.outputs.new_tag }}
+          body: ${{ steps.tag_version.outputs.changelog }}
+          # Set as pre-release if it's a pre-release tag (contains hyphen)
+          prerelease: ${{ contains(steps.tag_version.outputs.new_tag, '-') }}

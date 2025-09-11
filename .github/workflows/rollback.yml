@@ -1,0 +1,21 @@
+name: Rollback docker image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Docker image tag to deploy (commit SHA or version)"
+        required: false
+        default: "latest"
+
+jobs:
+  rollback:
+    runs-on: self-hosted
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rollback to specific tag
+        run: |
+          cd ~/sms-gw
+          echo "Rolling back to tag: ${{ github.event.inputs.tag }}"
+          ./deploy.sh ${{ github.event.inputs.tag }}

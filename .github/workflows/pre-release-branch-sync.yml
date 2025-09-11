@@ -1,0 +1,98 @@
+name: Pre-release branch sync
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+concurrency:
+  group: uat
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq gh
+
+      - name: Collect commits for PRs marked for UAT
+        id: collect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git fetch --tags origin
+          LAST_TAG=$(git tag --sort=-creatordate | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+' | head -n1 || true)
+
+          # All merged PRs with uat going into develop
+          gh pr list --repo "$REPO" --state merged --label "uat" \
+            --json number,mergeCommit,baseRefName \
+            | jq -r '.[] | select(.baseRefName=="develop") | "\(.number) \(.mergeCommit.oid)"' > all_uat_prs.txt
+
+          if [ ! -s all_uat_prs.txt ]; then
+            echo "No PRs found with uat label."
+            printf "" > prs_to_deploy.txt
+            printf "" > commits.txt
+          else
+            > prs_to_deploy.txt
+            > commits.txt
+            while read -r line; do
+              [ -z "$line" ] && continue
+              PR_NUMBER=$(echo "$line" | cut -d' ' -f1)
+              MERGE_COMMIT=$(echo "$line" | cut -d' ' -f2)
+              if [ -n "$LAST_TAG" ] && git tag --contains "$MERGE_COMMIT" | grep -q "^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+"; then
+                echo "PR #$PR_NUMBER already deployed, skipping"
+                continue
+              fi
+              echo "$PR_NUMBER" >> prs_to_deploy.txt
+              echo "$MERGE_COMMIT" >> commits.txt
+            done < all_uat_prs.txt
+          fi
+
+          if [ -s prs_to_deploy.txt ]; then
+            PRS=$(paste -sd, prs_to_deploy.txt)
+            echo "$PRS" > pr_numbers.txt
+            echo "PRs to promote: $PRS"
+          else
+            echo "" > pr_numbers.txt
+            echo "No new PRs for UAT promotion."
+          fi
+
+      - name: Set docker tag
+        id: version
+        run: |
+          LATEST=$(git tag --sort=-creatordate | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+' | head -n1 || echo "v0.0.0-rc.0")
+          # Extract version parts
+          if [[ $LATEST == *"-"* ]]; then
+            BASE_VERSION=$(echo "$LATEST" | sed -E 's/^v([0-9]+)\.([0-9]+)\.([0-9]+)-rc\.([0-9]+)/\1.\2.\3/')
+            RC_NUMBER=$(echo "$LATEST" | sed -E 's/^v([0-9]+)\.([0-9]+)\.([0-9]+)-rc\.([0-9]+)/\4/')
+            RC_NUMBER=$((RC_NUMBER+1))
+          else
+            BASE_VERSION="0.0.0"
+            RC_NUMBER=0
+          fi
+          IFS=. read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
+          NEW="v$MAJOR.$MINOR.$PATCH-rc.$RC_NUMBER"
+          echo "$NEW" > docker_tag.txt
+          echo "docker_tag=$NEW" >> "$GITHUB_OUTPUT"
+          echo "Using Docker tag: $NEW"
+
+      - name: Upload deployment artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-data
+          path: |
+            commits.txt
+            pr_numbers.txt
+            docker_tag.txt

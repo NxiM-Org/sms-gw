@@ -1,0 +1,152 @@
+name: Pre-release deployment
+
+on:
+  workflow_run:
+    workflows: ["Pre-release branch sync"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: uat
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      docker_tag: ${{ steps.out.outputs.docker_tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq gh
+
+      - name: Download deployment artifacts from prepare actions
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-data
+          run-id: ${{ github.event.workflow_run.id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: .
+
+      - name: Read inputs from artifact
+        id: inputs
+        run: |
+          set -euo pipefail
+          if [ ! -f docker_tag.txt ]; then echo "docker_tag.txt missing"; exit 1; fi
+          TAG=$(cat docker_tag.txt)
+          PRS=$( [ -f pr_numbers.txt ] && cat pr_numbers.txt || echo "" )
+
+          echo "docker_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "prs=$PRS" >> "$GITHUB_OUTPUT"
+
+          # If there are no PRs to deploy, we can exit gracefully later
+          if [ -z "$PRS" ]; then
+            echo "no_prs=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no_prs=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build branch for pre-release candidate
+        if: ${{ steps.inputs.outputs.no_prs == 'false' }}
+        run: |
+          set -euo pipefail
+          git fetch origin uat
+          git checkout -B uat-candidate origin/uat
+          git config user.name "GitHub Actions Bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if [ ! -f commits.txt ]; then
+            echo "No commits.txt found"; exit 1
+          fi
+
+          while read -r commit; do
+            [ -z "$commit" ] && continue
+            echo "Attempting to cherry-pick $commit"
+            if git merge-base --is-ancestor "$commit" HEAD 2>/dev/null; then
+              echo "Commit $commit already in history"; continue
+            fi
+            if git show --no-patch --format="%P" "$commit" | grep -q " "; then
+              git cherry-pick -x -m 1 "$commit" || { echo "Empty/conflict, skipping"; git cherry-pick --skip; }
+            else
+              git cherry-pick -x "$commit" || { echo "Empty/conflict, skipping"; git cherry-pick --skip; }
+            fi
+          done < commits.txt
+
+          git push origin uat-candidate --force
+
+      - name: Docker login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        if: ${{ steps.inputs.outputs.no_prs == 'false' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:${{ steps.inputs.outputs.docker_tag }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:latest-uat
+
+      - name: Remove label with gh
+        if: ${{ success() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra arr <<< "${{ steps.inputs.outputs.prs }}"
+          for num in "${arr[@]}"; do
+            [ -z "$num" ] && continue
+            echo "Removing 'promote:uat' from PR #$num"
+            gh pr edit "$num" --remove-label "promote:uat"
+          done
+
+      - name: Upload tag as job output (for next job)
+        id: out
+        run: echo "docker_tag=${{ steps.inputs.outputs.docker_tag }}" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: build-and-push
+    if: ${{ needs.build-and-push.result == 'success' }}
+    runs-on: self-hosted
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Docker login on server
+        run: |
+          echo ${{ secrets.DOCKERHUB_TOKEN }} | docker login -u ${{ secrets.DOCKERHUB_USERNAME }} --password-stdin
+
+      - name: Deploy to server
+        run: |
+          cd ~/sms-gw
+          ./deploy.sh "${{ needs.build-and-push.outputs.docker_tag || '' }}"
+
+      - name: Fast-forward uat to candidate and tag
+        run: |
+          set -euo pipefail
+          git fetch origin uat uat-candidate
+          git checkout uat
+          git merge origin/uat-candidate --ff-only
+          git push origin uat
+          VERSION="${{ needs.build-and-push.outputs.docker_tag || '' }}"
+          [ -z "$VERSION" ] && { echo "No version found"; exit 1; }
+          git tag -f "$VERSION"
+          git push origin "$VERSION" --force

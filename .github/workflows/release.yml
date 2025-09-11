@@ -1,0 +1,71 @@
+name: Release deployment
+
+on:
+  workflow_run:
+    workflows: ["Auto tag and release - Production and Pre-release"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  # Build for main/dev (skip when upstream run was on UAT)
+  build-and-push:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch != 'uat' }}
+    runs-on: ubuntu-latest
+    outputs:
+      docker_tag: ${{ steps.env.outputs.docker_tag }}
+    steps:
+      - name: Checkout code of triggering run
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Fetch tags and get latest for the triggering branch
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          BR="${{ github.event.workflow_run.head_branch }}"
+          # Expect tags like: v1.2.3, v2.0.1, etc.
+          TAG=$(git tag --sort=-creatordate | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+$" | head -n 1 || true)
+          if [ -z "$TAG" ]; then
+            echo "No matching tag found for branch '$BR'." >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Set docker tag
+        id: env
+        run: echo "docker_tag=${{ steps.tag.outputs.tag }}" >> "$GITHUB_OUTPUT"
+
+      - name: Docker login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:${{ steps.env.outputs.docker_tag }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:latest
+
+  deploy:
+    if: ${{ needs.build-and-push.result == 'success' }}
+    needs: build-and-push
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker login on server
+        run: |
+          echo ${{ secrets.DOCKERHUB_TOKEN }} | docker login -u ${{ secrets.DOCKERHUB_USERNAME }} --password-stdin
+      - name: Deploy to server
+        run: |
+          cd ~/sms-gw
+          ./deploy.sh ${{ secrets.DOCKERHUB_USERNAME }} ${{ needs.build-and-push.outputs.docker_tag }}
