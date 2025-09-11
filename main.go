@@ -16,6 +16,8 @@ import (
 func main() {
 	fmt.Println("Starting server...")
 
+	logrus.Infof("For non uat environment")
+
 	logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
 
 	levelStr := strings.ToLower("info") // Default log level
