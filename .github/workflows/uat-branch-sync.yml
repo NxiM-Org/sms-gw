@@ -19,9 +19,9 @@ permissions:
   pull-requests: write
 
 jobs:
-  create--uat-collective-branch:
+  create-uat-collective-branch:
     runs-on: ubuntu-latest
-    if: github.event.label.name == 'uat' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch'
 
     steps:
       - name: Checkout uat branch
@@ -66,30 +66,125 @@ jobs:
           git fetch origin ${{ github.event.inputs.source-branch || 'develop' }}:source-branch
           echo "Fetched source branch: ${{ github.event.inputs.source-branch || 'develop' }}"
 
-      - name: Get commits to merge
-        id: get-commits
+      - name: Get UAT PRs from source branch
+        id: get-uat-prs
         run: |
-          SOURCE_BRANCH="${{ github.event.inputs.source-branch || 'develop' }}"
+          # Get all merged PRs with uat label targeting the source branch
+          PRS_JSON=$(gh pr list --base "${{ github.event.inputs.source-branch || 'develop' }}" --state merged --label uat --json number,title,headRefName,url,mergeCommit)
 
-          # Get all commits that are in source branch but not in current uat branch
-          COMMITS_JSON=$(git log --pretty=format:'{"sha":"%H","author":"%an","date":"%ad","subject":"%s"}' --no-merges ${{ steps.branch-name.outputs.branch_name }}..source-branch | jq -s '.')
-
-          echo "commits_json<<EOF" >> $GITHUB_OUTPUT
-          echo "$COMMITS_JSON" >> $GITHUB_OUTPUT
+          echo "prs_json<<EOF" >> $GITHUB_OUTPUT
+          echo "$PRS_JSON" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-          COMMIT_COUNT=$(echo "$COMMITS_JSON" | jq length)
-          echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
-          echo "Found $COMMIT_COUNT commits to process"
+          PR_COUNT=$(echo "$PRS_JSON" | jq length)
+          echo "pr_count=$PR_COUNT" >> $GITHUB_OUTPUT
+          echo "Found $PR_COUNT UAT PRs"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
 
-      - name: Merge commits with exclusion
-        id: merge-commits
+      - name: Get commits from UAT PRs
+        id: get-uat-commits
         run: |
-          COMMITS_JSON='${{ steps.get-commits.outputs.commits_json }}'
+          PRS_JSON='${{ steps.get-uat-prs.outputs.prs_json }}'
+          ALL_UAT_COMMITS="[]"
+
+          for row in $(echo "$PRS_JSON" | jq -r '.[] | @base64'); do
+            _jq() {
+              echo ${row} | base64 --decode | jq -r ${1}
+            }
+            
+            PR_NUMBER=$(_jq '.number')
+            PR_TITLE=$(_jq '.title')
+            PR_BRANCH=$(_jq '.headRefName')
+            PR_URL=$(_jq '.url')
+            MERGE_COMMIT=$(_jq '.mergeCommit.oid')
+            
+            echo "Processing PR #$PR_NUMBER: $PR_TITLE"
+            
+            # Get all commits from this PR
+            PR_COMMITS_JSON=$(gh pr view $PR_NUMBER --json commits || echo '{"commits":[]}')
+            COMMITS=$(echo "$PR_COMMITS_JSON" | jq -c '.commits[]')
+            
+            # Add PR info to each commit
+            for commit_row in $(echo "$COMMITS" | jq -r '@base64'); do
+              _commit_jq() {
+                echo ${commit_row} | base64 --decode | jq -r ${1}
+              }
+              
+              COMMIT_SHA=$(_commit_jq '.oid')
+              COMMIT_MESSAGE=$(_commit_jq '.messageHeadline')
+              COMMIT_AUTHOR=$(_commit_jq '.author.name')
+              COMMIT_DATE=$(_commit_jq '.committedDate')
+              
+              COMMIT_OBJ=$(jq -n \
+                --arg sha "$COMMIT_SHA" \
+                --arg message "$COMMIT_MESSAGE" \
+                --arg author "$COMMIT_AUTHOR" \
+                --arg date "$COMMIT_DATE" \
+                --arg pr_number "$PR_NUMBER" \
+                --arg pr_title "$PR_TITLE" \
+                --arg pr_url "$PR_URL" \
+                '{
+                  sha: $sha,
+                  message: $message,
+                  author: $author,
+                  date: $date,
+                  pr_number: $pr_number,
+                  pr_title: $pr_title,
+                  pr_url: $pr_url
+                }')
+              
+              ALL_UAT_COMMITS=$(echo "$ALL_UAT_COMMITS" | jq --argjson commit "$COMMIT_OBJ" '. + [$commit]')
+            done
+          done
+
+          echo "uat_commits_json<<EOF" >> $GITHUB_OUTPUT
+          echo "$ALL_UAT_COMMITS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          COMMIT_COUNT=$(echo "$ALL_UAT_COMMITS" | jq length)
+          echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
+          echo "Found $COMMIT_COUNT commits from UAT PRs"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Filter commits already in uat branch
+        id: filter-commits
+        run: |
+          UAT_COMMITS_JSON='${{ steps.get-uat-commits.outputs.uat_commits_json }}'
+          FILTERED_COMMITS="[]"
+
+          # Get all commit SHAs already in current uat branch
+          EXISTING_COMMITS=$(git log --oneline --no-merges ${{ steps.branch-name.outputs.branch_name }} | awk '{print $1}')
+
+          for i in $(seq 0 $(($(echo "$UAT_COMMITS_JSON" | jq length) - 1))); do
+            COMMIT_SHA=$(echo "$UAT_COMMITS_JSON" | jq -r ".[$i].sha")
+            
+            # Check if commit is already in uat branch
+            if ! echo "$EXISTING_COMMITS" | grep -q "${COMMIT_SHA:0:7}"; then
+              # Commit not found in uat branch, add to filtered list
+              COMMIT_DATA=$(echo "$UAT_COMMITS_JSON" | jq ".[$i]")
+              FILTERED_COMMITS=$(echo "$FILTERED_COMMITS" | jq --argjson commit "$COMMIT_DATA" '. + [$commit]')
+            fi
+          done
+
+          echo "filtered_commits_json<<EOF" >> $GITHUB_OUTPUT
+          echo "$FILTERED_COMMITS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          FILTERED_COUNT=$(echo "$FILTERED_COMMITS" | jq length)
+          echo "filtered_count=$FILTERED_COUNT" >> $GITHUB_OUTPUT
+          echo "Filtered to $FILTERED_COUNT commits not in uat branch"
+
+      - name: Merge UAT PR commits with exclusion
+        id: merge-uat-commits
+        run: |
+          COMMITS_JSON='${{ steps.filter-commits.outputs.filtered_commits_json }}'
           EXCLUDED_COMMITS='${{ steps.exclude-commits.outputs.excluded_commits }}'
 
           MERGE_SUMMARY="## UAT Merge Summary - $(date +'%Y-%m-%d %H:%M:%S')\n\n"
-          MERGE_SUMMARY+="### Commit Merge Results:\n\n"
+          MERGE_SUMMARY+="### UAT PR Commit Merge Results:\n\n"
           MERGE_SUMMARY+="**Source branch:** ${{ github.event.inputs.source-branch || 'develop' }}\n"
           MERGE_SUMMARY+="**Excluded commits:** ${{ github.event.inputs.exclude-commits || 'None' }}\n\n"
 
@@ -114,52 +209,37 @@ jobs:
             return 1
           }
 
-          # Process commits in reverse order (oldest first) to maintain history
+          # Process commits
           for i in $(seq 0 $(($TOTAL_COMMITS - 1))); do
             COMMIT_SHA=$(echo "$COMMITS_JSON" | jq -r ".[$i].sha")
+            COMMIT_MESSAGE=$(echo "$COMMITS_JSON" | jq -r ".[$i].message")
             COMMIT_AUTHOR=$(echo "$COMMITS_JSON" | jq -r ".[$i].author")
             COMMIT_DATE=$(echo "$COMMITS_JSON" | jq -r ".[$i].date")
-            COMMIT_SUBJECT=$(echo "$COMMITS_JSON" | jq -r ".[$i].subject")
+            PR_NUMBER=$(echo "$COMMITS_JSON" | jq -r ".[$i].pr_number")
+            PR_TITLE=$(echo "$COMMITS_JSON" | jq -r ".[$i].pr_title")
+            PR_URL=$(echo "$COMMITS_JSON" | jq -r ".[$i].pr_url")
             
-            echo "Processing commit: $COMMIT_SHA - $COMMIT_SUBJECT"
+            echo "Processing commit: $COMMIT_SHA from PR #$PR_NUMBER"
 
             # Check if this commit should be excluded
             if should_exclude_commit "$COMMIT_SHA" "$EXCLUDED_COMMITS"; then
-              MERGE_SUMMARY+="🚫 \`${COMMIT_SHA:0:7}\`: $COMMIT_SUBJECT - Excluded\n"
+              MERGE_SUMMARY+="🚫 \`${COMMIT_SHA:0:7}\`: $COMMIT_MESSAGE (PR [#$PR_NUMBER]($PR_URL)) - Excluded\n"
               EXCLUDED_COUNT=$((EXCLUDED_COUNT + 1))
-              echo "Excluding commit: $COMMIT_SHA"
+              echo "Excluding commit: $COMMIT_SHA from PR #$PR_NUMBER"
               continue
             fi
 
             # Attempt to cherry-pick the commit
-            echo "Attempting to cherry-pick commit: $COMMIT_SHA"
+            echo "Attempting to cherry-pick commit: $COMMIT_SHA from PR #$PR_NUMBER"
             if git cherry-pick $COMMIT_SHA 2>&1; then
-              MERGE_SUMMARY+="✅ \`${COMMIT_SHA:0:7}\`: $COMMIT_SUBJECT - Merged successfully\n"
+              MERGE_SUMMARY+="✅ \`${COMMIT_SHA:0:7}\`: $COMMIT_MESSAGE (PR [#$PR_NUMBER]($PR_URL)) - Merged successfully\n"
               SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-              echo "Successfully cherry-picked commit: $COMMIT_SHA"
+              echo "Successfully cherry-picked commit: $COMMIT_SHA from PR #$PR_NUMBER"
             else
-              MERGE_SUMMARY+="❌ \`${COMMIT_SHA:0:7}\`: $COMMIT_SUBJECT - Merge failed\n"
+              MERGE_SUMMARY+="❌ \`${COMMIT_SHA:0:7}\`: $COMMIT_MESSAGE (PR [#$PR_NUMBER]($PR_URL)) - Merge failed\n"
               FAILED_COUNT=$((FAILED_COUNT + 1))
-              echo "Failed to cherry-pick commit: $COMMIT_SHA"
+              echo "Failed to cherry-pick commit: $COMMIT_SHA from PR #$PR_NUMBER"
               git cherry-pick --abort 2>/dev/null || true
-              
-              # If cherry-pick fails, try to apply as a patch
-              echo "Trying to apply as patch..."
-              if git show $COMMIT_SHA | git apply --3way - 2>&1; then
-                if git commit -m "$COMMIT_SUBJECT" --author="$COMMIT_AUTHOR" --date="$COMMIT_DATE" 2>&1; then
-                  MERGE_SUMMARY+="   ↳ ✅ Applied as patch successfully\n"
-                  SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-                  echo "Successfully applied commit as patch: $COMMIT_SHA"
-                else
-                  MERGE_SUMMARY+="   ↳ ❌ Failed to commit patch\n"
-                  echo "Failed to commit patch for: $COMMIT_SHA"
-                  git reset --hard HEAD 2>/dev/null || true
-                fi
-              else
-                MERGE_SUMMARY+="   ↳ ❌ Failed to apply patch\n"
-                echo "Failed to apply patch for: $COMMIT_SHA"
-                git reset --hard HEAD 2>/dev/null || true
-              fi
             fi
           done
 
@@ -176,17 +256,18 @@ jobs:
           fi
 
           MERGE_SUMMARY+="\n### Summary:\n"
-          MERGE_SUMMARY+="- ✅ Successfully merged: $SUCCESS_COUNT\n"
-          MERGE_SUMMARY+="- ❌ Failed: $FAILED_COUNT\n"
-          MERGE_SUMMARY+="- 🚫 Excluded: $EXCLUDED_COUNT\n"
-          MERGE_SUMMARY+="- 📊 Total commits: $TOTAL_COMMITS\n"
+          MERGE_SUMMARY+="- ✅ Successfully merged: $SUCCESS_COUNT commits\n"
+          MERGE_SUMMARY+="- ❌ Failed: $FAILED_COUNT commits\n"
+          MERGE_SUMMARY+="- 🚫 Excluded: $EXCLUDED_COUNT commits\n"
+          MERGE_SUMMARY+="- 📊 Total UAT PR commits processed: $TOTAL_COMMITS\n"
+          MERGE_SUMMARY+="- 🔖 UAT PRs found: ${{ steps.get-uat-prs.outputs.pr_count }}\n"
 
           echo -e "$MERGE_SUMMARY" > merge_summary.md
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push branch
-        if: steps.merge-commits.outputs.merge_status == 'success'
+        if: steps.merge-uat-commits.outputs.merge_status == 'success'
         run: |
           git push origin ${{ steps.branch-name.outputs.branch_name }}
           echo "Pushed branch: ${{ steps.branch-name.outputs.branch_name }}"
@@ -196,12 +277,14 @@ jobs:
           echo "=== UAT Merge Operation Complete ==="
           echo "Branch: ${{ steps.branch-name.outputs.branch_name }}"
           echo "Source branch: ${{ github.event.inputs.source-branch || 'develop' }}"
-          echo "Merge Status: ${{ steps.merge-commits.outputs.merge_status }}"
-          echo "Total commits found: ${{ steps.get-commits.outputs.commit_count }}"
-          echo "Successfully merged: ${{ steps.merge-commits.outputs.success_count }}"
-          echo "Failed: ${{ steps.merge-commits.outputs.failed_count }}"
-          echo "Excluded: ${{ steps.merge-commits.outputs.excluded_count }}"
-          echo "Final status: ${{ steps.merge-commits.outputs.merge_status }}"
+          echo "Merge Status: ${{ steps.merge-uat-commits.outputs.merge_status }}"
+          echo "UAT PRs found: ${{ steps.get-uat-prs.outputs.pr_count }}"
+          echo "UAT commits found: ${{ steps.get-uat-commits.outputs.commit_count }}"
+          echo "Commits to process: ${{ steps.filter-commits.outputs.filtered_count }}"
+          echo "Successfully merged: ${{ steps.merge-uat-commits.outputs.success_count }}"
+          echo "Failed: ${{ steps.merge-uat-commits.outputs.failed_count }}"
+          echo "Excluded: ${{ steps.merge-uat-commits.outputs.excluded_count }}"
+          echo "Final status: ${{ steps.merge-uat-commits.outputs.merge_status }}"
 
           if [ -f merge_summary.md ]; then
             echo "Merge Summary:"
