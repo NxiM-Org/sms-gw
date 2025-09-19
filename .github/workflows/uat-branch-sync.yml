@@ -9,7 +9,12 @@ on:
         default: "develop"
         type: string
       exclude-commits:
-        description: "Comma-separated list of commit SHAs to exclude from merging"
+        description: "Comma-separated list of commit SHAs to exclude"
+        required: false
+        default: ""
+        type: string
+      exclude-prs:
+        description: "Comma-separated list of PR numbers to exclude (entire PRs)"
         required: false
         default: ""
         type: string
@@ -19,9 +24,9 @@ permissions:
   pull-requests: write
 
 jobs:
-  create-uat-collective-branch:
+  create--uat-collective-branch:
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event.label.name == 'uat' || github.event_name == 'workflow_dispatch'
 
     steps:
       - name: Checkout uat branch
@@ -48,18 +53,29 @@ jobs:
           git checkout -b ${{ steps.branch-name.outputs.branch_name }}
           echo "Created branch: ${{ steps.branch-name.outputs.branch_name }}"
 
-      - name: Parse excluded commits
-        id: exclude-commits
+      - name: Parse excluded items
+        id: exclude-items
         run: |
+          # Parse excluded commits
           EXCLUDED_COMMITS="${{ github.event.inputs.exclude-commits }}"
-          # Convert comma-separated list to JSON array
           if [ -n "$EXCLUDED_COMMITS" ]; then
-            EXCLUDED_JSON=$(echo "$EXCLUDED_COMMITS" | jq -R -s -c 'split(",") | map(select(. != ""))')
+            EXCLUDED_COMMITS_JSON=$(echo "$EXCLUDED_COMMITS" | jq -R -s -c 'split(",") | map(select(. != ""))')
           else
-            EXCLUDED_JSON="[]"
+            EXCLUDED_COMMITS_JSON="[]"
           fi
-          echo "excluded_commits=$EXCLUDED_JSON" >> $GITHUB_OUTPUT
-          echo "Excluded commits: $EXCLUDED_JSON"
+          echo "excluded_commits=$EXCLUDED_COMMITS_JSON" >> $GITHUB_OUTPUT
+
+          # Parse excluded PRs
+          EXCLUDED_PRS="${{ github.event.inputs.exclude-prs }}"
+          if [ -n "$EXCLUDED_PRS" ]; then
+            EXCLUDED_PRS_JSON=$(echo "$EXCLUDED_PRS" | jq -R -s -c 'split(",") | map(select(. != ""))')
+          else
+            EXCLUDED_PRS_JSON="[]"
+          fi
+          echo "excluded_prs=$EXCLUDED_PRS_JSON" >> $GITHUB_OUTPUT
+
+          echo "Excluded commits: $EXCLUDED_COMMITS_JSON"
+          echo "Excluded PRs: $EXCLUDED_PRS_JSON"
 
       - name: Fetch source branch
         run: |
@@ -87,6 +103,7 @@ jobs:
         id: get-uat-commits
         run: |
           PRS_JSON='${{ steps.get-uat-prs.outputs.prs_json }}'
+          EXCLUDED_PRS='${{ steps.exclude-items.outputs.excluded_prs }}'
           ALL_UAT_COMMITS="[]"
 
           for row in $(echo "$PRS_JSON" | jq -r '.[] | @base64'); do
@@ -101,6 +118,12 @@ jobs:
             MERGE_COMMIT=$(_jq '.mergeCommit.oid')
             
             echo "Processing PR #$PR_NUMBER: $PR_TITLE"
+            
+            # Check if entire PR should be excluded
+            if echo "$EXCLUDED_PRS" | jq -r '.[]' | grep -q "^$PR_NUMBER$"; then
+              echo "Skipping entire PR #$PR_NUMBER - excluded by filter"
+              continue
+            fi
             
             # Get all commits from this PR
             PR_COMMITS_JSON=$(gh pr view $PR_NUMBER --json commits || echo '{"commits":[]}')
@@ -145,7 +168,7 @@ jobs:
 
           COMMIT_COUNT=$(echo "$ALL_UAT_COMMITS" | jq length)
           echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
-          echo "Found $COMMIT_COUNT commits from UAT PRs"
+          echo "Found $COMMIT_COUNT commits from UAT PRs (after PR exclusion)"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -181,16 +204,18 @@ jobs:
         id: merge-uat-commits
         run: |
           COMMITS_JSON='${{ steps.filter-commits.outputs.filtered_commits_json }}'
-          EXCLUDED_COMMITS='${{ steps.exclude-commits.outputs.excluded_commits }}'
+          EXCLUDED_COMMITS='${{ steps.exclude-items.outputs.excluded_commits }}'
 
           MERGE_SUMMARY="## UAT Merge Summary - $(date +'%Y-%m-%d %H:%M:%S')\n\n"
           MERGE_SUMMARY+="### UAT PR Commit Merge Results:\n\n"
           MERGE_SUMMARY+="**Source branch:** ${{ github.event.inputs.source-branch || 'develop' }}\n"
-          MERGE_SUMMARY+="**Excluded commits:** ${{ github.event.inputs.exclude-commits || 'None' }}\n\n"
+          MERGE_SUMMARY+="**Excluded commits:** ${{ github.event.inputs.exclude-commits || 'None' }}\n"
+          MERGE_SUMMARY+="**Excluded PRs:** ${{ github.event.inputs.exclude-prs || 'None' }}\n\n"
 
           SUCCESS_COUNT=0
           FAILED_COUNT=0
-          EXCLUDED_COUNT=0
+          EXCLUDED_COMMIT_COUNT=0
+          EXCLUDED_PR_COUNT=0
           TOTAL_COMMITS=$(echo "$COMMITS_JSON" | jq length)
 
           # Check if commit should be excluded
@@ -209,6 +234,10 @@ jobs:
             return 1
           }
 
+          # Count excluded PRs
+          EXCLUDED_PR_COUNT=$((${{ steps.get-uat-prs.outputs.pr_count }} - $(echo "$COMMITS_JSON" | jq 'map(.pr_number) | unique | length')))
+          echo "excluded_pr_count=$EXCLUDED_PR_COUNT" >> $GITHUB_OUTPUT
+
           # Process commits
           for i in $(seq 0 $(($TOTAL_COMMITS - 1))); do
             COMMIT_SHA=$(echo "$COMMITS_JSON" | jq -r ".[$i].sha")
@@ -223,8 +252,8 @@ jobs:
 
             # Check if this commit should be excluded
             if should_exclude_commit "$COMMIT_SHA" "$EXCLUDED_COMMITS"; then
-              MERGE_SUMMARY+="🚫 \`${COMMIT_SHA:0:7}\`: $COMMIT_MESSAGE (PR [#$PR_NUMBER]($PR_URL)) - Excluded\n"
-              EXCLUDED_COUNT=$((EXCLUDED_COUNT + 1))
+              MERGE_SUMMARY+="🚫 \`${COMMIT_SHA:0:7}\`: $COMMIT_MESSAGE (PR [#$PR_NUMBER]($PR_URL)) - Excluded commit\n"
+              EXCLUDED_COMMIT_COUNT=$((EXCLUDED_COMMIT_COUNT + 1))
               echo "Excluding commit: $COMMIT_SHA from PR #$PR_NUMBER"
               continue
             fi
@@ -245,12 +274,12 @@ jobs:
 
           echo "success_count=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
           echo "failed_count=$FAILED_COUNT" >> $GITHUB_OUTPUT
-          echo "excluded_count=$EXCLUDED_COUNT" >> $GITHUB_OUTPUT
+          echo "excluded_commit_count=$EXCLUDED_COMMIT_COUNT" >> $GITHUB_OUTPUT
 
           if [ $SUCCESS_COUNT -gt 0 ]; then
             echo "merge_status=success" >> $GITHUB_OUTPUT
-          elif [ $EXCLUDED_COUNT -eq $TOTAL_COMMITS ]; then
-            echo "merge_status=all_excluded" >> $GITHUB_OUTPUT
+          elif [ $TOTAL_COMMITS -eq 0 ]; then
+            echo "merge_status=no_commits" >> $GITHUB_OUTPUT
           else
             echo "merge_status=failed" >> $GITHUB_OUTPUT
           fi
@@ -258,7 +287,8 @@ jobs:
           MERGE_SUMMARY+="\n### Summary:\n"
           MERGE_SUMMARY+="- ✅ Successfully merged: $SUCCESS_COUNT commits\n"
           MERGE_SUMMARY+="- ❌ Failed: $FAILED_COUNT commits\n"
-          MERGE_SUMMARY+="- 🚫 Excluded: $EXCLUDED_COUNT commits\n"
+          MERGE_SUMMARY+="- 🚫 Excluded commits: $EXCLUDED_COMMIT_COUNT commits\n"
+          MERGE_SUMMARY+="- 🔇 Excluded PRs: $EXCLUDED_PR_COUNT PRs\n"
           MERGE_SUMMARY+="- 📊 Total UAT PR commits processed: $TOTAL_COMMITS\n"
           MERGE_SUMMARY+="- 🔖 UAT PRs found: ${{ steps.get-uat-prs.outputs.pr_count }}\n"
 
@@ -283,7 +313,8 @@ jobs:
           echo "Commits to process: ${{ steps.filter-commits.outputs.filtered_count }}"
           echo "Successfully merged: ${{ steps.merge-uat-commits.outputs.success_count }}"
           echo "Failed: ${{ steps.merge-uat-commits.outputs.failed_count }}"
-          echo "Excluded: ${{ steps.merge-uat-commits.outputs.excluded_count }}"
+          echo "Excluded commits: ${{ steps.merge-uat-commits.outputs.excluded_commit_count }}"
+          echo "Excluded PRs: ${{ steps.merge-uat-commits.outputs.excluded_pr_count }}"
           echo "Final status: ${{ steps.merge-uat-commits.outputs.merge_status }}"
 
           if [ -f merge_summary.md ]; then
