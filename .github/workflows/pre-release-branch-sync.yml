@@ -2,6 +2,11 @@ name: Pre-release branch sync
 
 on:
   workflow_dispatch:
+    inputs:
+      exclude-commits:
+        description: "Comma-separated list of commit SHAs to exclude from deployment (must be valid 40-character SHA1 hashes)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -25,6 +30,55 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq gh
 
+      - name: Validate excluded commits input
+        id: validate-input
+        run: |
+          EXCLUDED_COMMITS="${{ inputs.exclude-commits }}"
+
+          if [ -z "$EXCLUDED_COMMITS" ]; then
+            echo "No commits to exclude provided."
+            echo "validated_excludes=" >> $GITHUB_OUTPUT
+            echo "has_excludes=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          IFS=',' read -ra COMMIT_ARRAY <<< "$EXCLUDED_COMMITS"
+          VALID_COMMITS=()
+          INVALID_COMMITS=()
+
+          for commit in "${COMMIT_ARRAY[@]}"; do
+            commit=$(echo "$commit" | xargs) # Trim whitespace
+            if [ -z "$commit" ]; then
+              continue
+            fi
+            
+            # Validate SHA1 format (40 hex characters)
+            if [[ "$commit" =~ ^[a-fA-F0-9]{40}$ ]]; then
+              VALID_COMMITS+=("$commit")
+            else
+              INVALID_COMMITS+=("$commit")
+            fi
+          done
+
+          if [ ${#INVALID_COMMITS[@]} -gt 0 ]; then
+            echo "Warning: The following commit SHAs are invalid and will be ignored:"
+            printf '%s\n' "${INVALID_COMMITS[@]}"
+            echo "Valid commit SHAs must be 40-character hexadecimal strings."
+          fi
+
+          if [ ${#VALID_COMMITS[@]} -gt 0 ]; then
+            # Create a file with excluded commits for efficient lookup
+            printf '%s\n' "${VALID_COMMITS[@]}" > excluded_commits.txt
+            VALIDATED_EXCLUDES=$(IFS=','; echo "${VALID_COMMITS[*]}")
+            echo "Number of valid commits to exclude: ${#VALID_COMMITS[@]}"
+            echo "validated_excludes=$VALIDATED_EXCLUDES" >> $GITHUB_OUTPUT
+            echo "has_excludes=true" >> $GITHUB_OUTPUT
+          else
+            echo "No valid commit SHAs provided for exclusion."
+            echo "validated_excludes=" >> $GITHUB_OUTPUT
+            echo "has_excludes=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Collect commits for PRs marked for UAT
         id: collect
         env:
@@ -34,6 +88,18 @@ jobs:
           set -euo pipefail
           git fetch --tags origin
           LAST_TAG=$(git tag --sort=-creatordate | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+' | head -n1 || true)
+
+          # Check if we have excludes and use efficient lookup method
+          HAS_EXCLUDES="${{ steps.validate-input.outputs.has_excludes }}"
+          if [ "$HAS_EXCLUDES" = "true" ]; then
+            echo "Using efficient commit exclusion method for large input"
+            # Create a sorted excluded commits file for efficient lookup
+            sort excluded_commits.txt > excluded_commits_sorted.txt
+            EXCLUDED_COUNT=$(wc -l < excluded_commits_sorted.txt)
+            echo "Excluding $EXCLUDED_COUNT commits from deployment"
+          else
+            echo "No commits to exclude."
+          fi
 
           # All merged PRs with uat going into develop
           gh pr list --repo "$REPO" --state merged --label "uat" \
@@ -47,17 +113,45 @@ jobs:
           else
             > prs_to_deploy.txt
             > commits.txt
-            while read -r line; do
-              [ -z "$line" ] && continue
-              PR_NUMBER=$(echo "$line" | cut -d' ' -f1)
-              MERGE_COMMIT=$(echo "$line" | cut -d' ' -f2)
-              if [ -n "$LAST_TAG" ] && git tag --contains "$MERGE_COMMIT" | grep -q "^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+"; then
-                echo "PR #$PR_NUMBER already deployed, skipping"
-                continue
-              fi
-              echo "$PR_NUMBER" >> prs_to_deploy.txt
-              echo "$MERGE_COMMIT" >> commits.txt
-            done < all_uat_prs.txt
+            
+            # Extract just the commit SHAs for efficient processing
+            cut -d' ' -f2 all_uat_prs.txt > all_commits.txt
+            
+            if [ "$HAS_EXCLUDES" = "true" ]; then
+              # Use efficient sorting and comm command to filter out excluded commits
+              sort all_commits.txt > all_commits_sorted.txt
+              comm -23 all_commits_sorted.txt excluded_commits_sorted.txt > filtered_commits.txt
+              
+              # Now process only the filtered commits
+              while read -r MERGE_COMMIT; do
+                [ -z "$MERGE_COMMIT" ] && continue
+                
+                # Find the PR number for this commit
+                PR_NUMBER=$(grep "$MERGE_COMMIT" all_uat_prs.txt | cut -d' ' -f1)
+                
+                if [ -n "$LAST_TAG" ] && git tag --contains "$MERGE_COMMIT" | grep -q "^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+"; then
+                  echo "PR #$PR_NUMBER already deployed, skipping"
+                  continue
+                fi
+                echo "$PR_NUMBER" >> prs_to_deploy.txt
+                echo "$MERGE_COMMIT" >> commits.txt
+              done < filtered_commits.txt
+              
+            else
+              # Original processing for no excludes
+              while read -r line; do
+                [ -z "$line" ] && continue
+                PR_NUMBER=$(echo "$line" | cut -d' ' -f1)
+                MERGE_COMMIT=$(echo "$line" | cut -d' ' -f2)
+                
+                if [ -n "$LAST_TAG" ] && git tag --contains "$MERGE_COMMIT" | grep -q "^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+"; then
+                  echo "PR #$PR_NUMBER already deployed, skipping"
+                  continue
+                fi
+                echo "$PR_NUMBER" >> prs_to_deploy.txt
+                echo "$MERGE_COMMIT" >> commits.txt
+              done < all_uat_prs.txt
+            fi
           fi
 
           if [ -s prs_to_deploy.txt ]; then
