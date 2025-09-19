@@ -47,7 +47,7 @@ jobs:
         id: get-prs
         run: |
           # Get all PRs with uat label targeting develop
-          PRS_JSON=$(gh pr list --repo "$REPO" --state merged --label uat --base develop --json number,title,headRefName,url,state,mergeCommit)
+          PRS_JSON=$(gh pr list --repo "$REPO" --state merged --label uat --base develop --json number,title,headRefName,url,state)
           echo "prs_json<<EOF" >> $GITHUB_OUTPUT
           echo "$PRS_JSON" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
@@ -70,7 +70,7 @@ jobs:
           echo "excluded_commits=$EXCLUDED_JSON" >> $GITHUB_OUTPUT
           echo "Excluded commits: $EXCLUDED_JSON"
 
-      - name: Verify and merge PRs
+      - name: Verify and merge PRs with commit exclusion
         id: verify-merge-prs
         run: |
           PRS_JSON='${{ steps.get-prs.outputs.prs_json }}'
@@ -83,7 +83,7 @@ jobs:
           SUCCESS_COUNT=0
           FAILED_COUNT=0
           SKIPPED_COUNT=0
-          EXCLUDED_COUNT=0
+          EXCLUDED_COMMIT_COUNT=0
 
           # Check if branch exists before attempting merge
           check_branch_exists() {
@@ -121,6 +121,83 @@ jobs:
             return 1
           }
 
+          # Function to merge PR with commit exclusion
+          merge_pr_with_exclusion() {
+            local pr_branch=$1
+            local pr_number=$2
+            local pr_title=$3
+            local pr_url=$4
+            
+            echo "Fetching branch: $pr_branch"
+            FETCH_ATTEMPTS=3
+            FETCH_SUCCESS=false
+            
+            for attempt in $(seq 1 $FETCH_ATTEMPTS); do
+              echo "Fetch attempt $attempt of $FETCH_ATTEMPTS"
+              if git fetch origin $pr_branch 2>&1; then
+                FETCH_SUCCESS=true
+                break
+              else
+                echo "Fetch failed on attempt $attempt, waiting 2 seconds..."
+                sleep 2
+              fi
+            done
+
+            if [ "$FETCH_SUCCESS" = false ]; then
+              echo "Failed to fetch branch after $FETCH_ATTEMPTS attempts"
+              return 1
+            fi
+
+            # Get the list of commits in the PR branch that are not in current branch
+            COMMITS_TO_MERGE=$(git log --oneline --no-merges ${{ steps.branch-name.outputs.branch_name }}..FETCH_HEAD | awk '{print $1}')
+            
+            if [ -z "$COMMITS_TO_MERGE" ]; then
+              echo "No new commits to merge from PR branch $pr_branch"
+              return 0
+            fi
+
+            # Filter out excluded commits
+            COMMITS_TO_APPLY=()
+            EXCLUDED_IN_PR=0
+            
+            for commit in $COMMITS_TO_MERGE; do
+              if should_exclude_commit "$commit" "$EXCLUDED_COMMITS"; then
+                echo "Excluding commit: $commit"
+                EXCLUDED_IN_PR=$((EXCLUDED_IN_PR + 1))
+                EXCLUDED_COMMIT_COUNT=$((EXCLUDED_COMMIT_COUNT + 1))
+              else
+                COMMITS_TO_APPLY+=("$commit")
+              fi
+            done
+
+            echo "Commits to apply: ${#COMMITS_TO_APPLY[@]}"
+            echo "Commits excluded: $EXCLUDED_IN_PR"
+
+            if [ ${#COMMITS_TO_APPLY[@]} -eq 0 ]; then
+              echo "All commits in this PR are excluded"
+              return 2
+            fi
+
+            # Apply each commit individually using cherry-pick
+            for commit in "${COMMITS_TO_APPLY[@]}"; do
+              echo "Applying commit: $commit"
+              if git cherry-pick $commit 2>&1; then
+                echo "Successfully applied commit: $commit"
+              else
+                echo "Failed to apply commit: $commit"
+                git cherry-pick --abort 2>/dev/null || true
+                return 1
+              fi
+            done
+
+            # Add information about excluded commits in this PR
+            if [ $EXCLUDED_IN_PR -gt 0 ]; then
+              MERGE_SUMMARY+=" (Excluded $EXCLUDED_IN_PR commits)"
+            fi
+            
+            return 0
+          }
+
           for row in $(echo "$PRS_JSON" | jq -r '.[] | @base64'); do
             _jq() {
               echo ${row} | base64 --decode | jq -r ${1}
@@ -131,17 +208,8 @@ jobs:
             PR_BRANCH=$(_jq '.headRefName')
             PR_URL=$(_jq '.url')
             PR_STATE=$(_jq '.state')
-            MERGE_COMMIT=$(_jq '.mergeCommit.oid')
             
-            echo "Processing PR #$PR_NUMBER: $PR_TITLE (branch: $PR_BRANCH, merge commit: $MERGE_COMMIT)"
-
-            # Check if this commit should be excluded
-            if should_exclude_commit "$MERGE_COMMIT" "$EXCLUDED_COMMITS"; then
-              MERGE_SUMMARY+="🚫 **#$PR_NUMBER**: [$PR_TITLE]($PR_URL) - Excluded (commit: \`$MERGE_COMMIT\`)\n"
-              EXCLUDED_COUNT=$((EXCLUDED_COUNT + 1))
-              echo "Excluding PR #$PR_NUMBER - commit $MERGE_COMMIT is in exclusion list"
-              continue
-            fi
+            echo "Processing PR #$PR_NUMBER: $PR_TITLE (branch: $PR_BRANCH)"
 
             # Check if PR is already merged using individual PR view
             if check_pr_merged $PR_NUMBER; then
@@ -159,54 +227,39 @@ jobs:
               continue
             fi
 
-            # Fetch the PR branch with retry logic
-            echo "Fetching branch: $PR_BRANCH"
-            FETCH_ATTEMPTS=3
-            FETCH_SUCCESS=false
+            # Attempt to merge with commit exclusion
+            MERGE_SUMMARY+="🔧 **#$PR_NUMBER**: [$PR_TITLE]($PR_URL) - "
             
-            for attempt in $(seq 1 $FETCH_ATTEMPTS); do
-              echo "Fetch attempt $attempt of $FETCH_ATTEMPTS"
-              if git fetch origin $PR_BRANCH 2>&1; then
-                FETCH_SUCCESS=true
-                break
-              else
-                echo "Fetch failed on attempt $attempt, waiting 2 seconds..."
-                sleep 2
-              fi
-            done
+            merge_result=$(merge_pr_with_exclusion "$PR_BRANCH" "$PR_NUMBER" "$PR_TITLE" "$PR_URL" 2>&1)
+            merge_exit_code=$?
 
-            if [ "$FETCH_SUCCESS" = false ]; then
-              MERGE_SUMMARY+="❌ **#$PR_NUMBER**: [$PR_TITLE]($PR_URL) - Failed to fetch branch after $FETCH_ATTEMPTS attempts\n"
-              FAILED_COUNT=$((FAILED_COUNT + 1))
-              continue
-            fi
-
-            # Attempt to merge
-            echo "Attempting to merge PR #$PR_NUMBER"
-            if git merge --no-ff -m "Merge pull request #$PR_NUMBER from $PR_BRANCH" FETCH_HEAD 2>&1; then
-              MERGE_SUMMARY+="✅ **#$PR_NUMBER**: [$PR_TITLE]($PR_URL) - Merged successfully"
+            if [ $merge_exit_code -eq 0 ]; then
+              MERGE_SUMMARY+="Merged successfully"
               if [ "$PR_STATE" != "OPEN" ]; then
                 MERGE_SUMMARY+=" (PR was $PR_STATE)"
               fi
               MERGE_SUMMARY+="\n"
               SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-              echo "Successfully merged PR #$PR_NUMBER"
+              echo "Successfully merged PR #$PR_NUMBER with commit exclusion"
+            elif [ $merge_exit_code -eq 2 ]; then
+              MERGE_SUMMARY+="Skipped (All commits excluded)\n"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              echo "Skipped PR #$PR_NUMBER - all commits excluded"
             else
-              MERGE_SUMMARY+="⚠️ **#$PR_NUMBER**: [$PR_TITLE]($PR_URL) - Merge conflict"
+              MERGE_SUMMARY+="Merge failed"
               if [ "$PR_STATE" != "OPEN" ]; then
                 MERGE_SUMMARY+=" (PR was $PR_STATE)"
               fi
               MERGE_SUMMARY+="\n"
               FAILED_COUNT=$((FAILED_COUNT + 1))
-              echo "Merge conflict in PR #$PR_NUMBER"
-              git merge --abort 2>/dev/null || true
+              echo "Merge failed for PR #$PR_NUMBER"
             fi
           done
 
           echo "success_count=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
           echo "failed_count=$FAILED_COUNT" >> $GITHUB_OUTPUT
           echo "skipped_count=$SKIPPED_COUNT" >> $GITHUB_OUTPUT
-          echo "excluded_count=$EXCLUDED_COUNT" >> $GITHUB_OUTPUT
+          echo "excluded_commit_count=$EXCLUDED_COMMIT_COUNT" >> $GITHUB_OUTPUT
 
           if [ $SUCCESS_COUNT -gt 0 ]; then
             echo "merge_status=partial_success" >> $GITHUB_OUTPUT
@@ -217,9 +270,9 @@ jobs:
           MERGE_SUMMARY+="\n### Summary:\n"
           MERGE_SUMMARY+="- ✅ Successfully merged: $SUCCESS_COUNT\n"
           MERGE_SUMMARY+="- ❌ Failed: $FAILED_COUNT\n"
-          MERGE_SUMMARY+="- ➖ Skipped (already merged): $SKIPPED_COUNT\n"
-          MERGE_SUMMARY+="- 🚫 Excluded: $EXCLUDED_COUNT\n"
-          MERGE_SUMMARY+="- 📊 Total processed: $((SUCCESS_COUNT + FAILED_COUNT + SKIPPED_COUNT + EXCLUDED_COUNT))\n"
+          MERGE_SUMMARY+="- ➖ Skipped: $SKIPPED_COUNT\n"
+          MERGE_SUMMARY+="- 🚫 Excluded commits: $EXCLUDED_COMMIT_COUNT\n"
+          MERGE_SUMMARY+="- 📊 Total PRs processed: $((SUCCESS_COUNT + FAILED_COUNT + SKIPPED_COUNT))\n"
 
           echo -e "$MERGE_SUMMARY" > merge_summary.md
         env:
@@ -239,8 +292,8 @@ jobs:
           echo "Total PRs found: ${{ steps.get-prs.outputs.pr_count }}"
           echo "Successfully merged: ${{ steps.verify-merge-prs.outputs.success_count }}"
           echo "Failed: ${{ steps.verify-merge-prs.outputs.failed_count }}"
-          echo "Skipped (already merged): ${{ steps.verify-merge-prs.outputs.skipped_count }}"
-          echo "Excluded: ${{ steps.verify-merge-prs.outputs.excluded_count }}"
+          echo "Skipped: ${{ steps.verify-merge-prs.outputs.skipped_count }}"
+          echo "Excluded commits: ${{ steps.verify-merge-prs.outputs.excluded_commit_count }}"
           echo "Final status: ${{ steps.verify-merge-prs.outputs.merge_status }}"
 
           if [ -f merge_summary.md ]; then
